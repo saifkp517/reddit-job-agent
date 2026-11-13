@@ -3,16 +3,15 @@
 - Filters Reddit posts with keywords + regex only (no LLM, no cost).
 - Drafts the email from a template (mail_mode=template, free) or with Claude
   using the editable prompt in mail_prompt.md (mail_mode=ai).
-- Dry run: every draft goes to Discord with Send / Edit / Skip buttons.
-- Talk to the bot in the Discord channel; Claude Haiku answers and can change
-  settings, rewrite the mail prompt or template, and preview drafts.
+- Dry run: every draft goes to Discord with Send / Edit / AI draft / Skip buttons.
+- Control it with free !commands in Discord. Claude is only used to write a draft
+  when you ask (!draft <link> or the AI draft button). There is no AI chat.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -51,8 +50,7 @@ SMTP_PASSWORD = env("SMTP_PASSWORD")
 FROM_NAME = env("FROM_NAME", "")
 RESUME_PATH = env("RESUME_PATH", "")  # optional PDF attachment; the template already links the resume
 
-CHAT_MODEL = env("CHAT_MODEL", "claude-haiku-5-5")  # Discord assistant
-MAIL_MODEL = env("MAIL_MODEL", "claude-haiku-5-5")  # used only when mail_mode=ai
+MAIL_MODEL = env("MAIL_MODEL", "claude-haiku-5-5")  # AI drafts: !draft, the AI draft button, mail_mode=ai
 
 PROFILE_FILE = HERE / "profile.md"
 PROMPT_FILE = HERE / "mail_prompt.md"
@@ -188,7 +186,7 @@ _claude = None
 
 
 def claude_client():
-    """Import the Anthropic SDK only when Claude is actually used (chat or mail_mode=ai)."""
+    """Import the Anthropic SDK only when Claude is actually used (an AI draft)."""
     global _claude
     if _claude is None:
         import anthropic
@@ -270,10 +268,22 @@ def draft_embed(row: dict, color: discord.Color = discord.Color.blurple()) -> di
 
 def draft_buttons(post_id: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Send", style=discord.ButtonStyle.success, custom_id=f"send:{post_id}"))
+    row = load(post_id) or {}
+    if row.get("email"):  # no address = draft is for a DM/form you send yourself
+        view.add_item(discord.ui.Button(label="Send", style=discord.ButtonStyle.success, custom_id=f"send:{post_id}"))
     view.add_item(discord.ui.Button(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"edit:{post_id}"))
+    view.add_item(discord.ui.Button(label="AI draft", style=discord.ButtonStyle.primary, custom_id=f"ai:{post_id}"))
     view.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.danger, custom_id=f"skip:{post_id}"))
     return view
+
+
+async def ai_redraft(post_id: str) -> str:
+    """Rewrite one post's draft with Claude. Only runs when you ask (button or !draft)."""
+    post = await reddit.submission(id=post_id)
+    await post.load()
+    subject, body = await ai_draft(post.title, post.selftext or "", post.subreddit.display_name)
+    save(post_id, subject=subject, body=body)
+    return "AI draft ready."
 
 
 class EditModal(discord.ui.Modal, title="Edit email"):
@@ -297,7 +307,7 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
         return
     action, _, post_id = (interaction.data or {}).get("custom_id", "").partition(":")
-    if action not in {"send", "edit", "skip"}:
+    if action not in {"send", "edit", "skip", "ai"}:
         return
     if interaction.user.id != DISCORD_OWNER_ID:
         await interaction.response.send_message("Not yours.", ephemeral=True)
@@ -311,6 +321,14 @@ async def on_interaction(interaction: discord.Interaction):
         save(post_id, status="rejected")
         await interaction.response.edit_message(content="Skipped.",
                                                 embed=draft_embed(row, discord.Color.dark_grey()), view=None)
+    elif action == "ai":
+        await interaction.response.defer()
+        try:
+            result = await ai_redraft(post_id)
+        except Exception as e:
+            result = f"AI draft failed: {e}"
+        await interaction.message.edit(content=result, embed=draft_embed(load(post_id)),
+                                       view=draft_buttons(post_id))
     else:
         await interaction.response.defer()
         result = await send_email(post_id)
@@ -398,123 +416,6 @@ async def poll_reddit() -> None:
         await asyncio.sleep(int(setting("poll_seconds")))
 
 
-# ------------------------------------------------- Haiku chat assistant -----
-CHAT_SYSTEM = """You are the control assistant for the user's Reddit job-application bot, chatting in Discord.
-Be brief and plain. Use the tools to answer questions and make changes; never claim a change you didn't make.
-
-How the bot works: it polls subreddits, keeps posts matching include keywords and not matching exclude
-keywords, requires an email in the post, drafts an email (mail_mode "template" = free fixed template,
-"ai" = Claude writes it from the mail prompt), and in dry run posts each draft here with Send/Edit/Skip buttons.
-Each check fetches the 50 newest posts from each subreddit separately (days to weeks back on quiet subs).
-When asked what's happening, how it's going, or why nothing showed up: call get_status (last checks, skip
-reasons) and list_posts, and answer from that data. Most hiring posts say "DM me" instead of giving an email,
-so "hiring post, but no email" is the usual reason nothing shows up.
-
-When the user asks to change how emails are written: read the current mail prompt (or template), rewrite the
-WHOLE text with their change applied, keep everything else, and save it with the tool. Then summarize the
-change in one or two lines. The mail prompt must keep focusing on what the candidate can do for the employer,
-not on past achievements, unless the user explicitly says otherwise.
-Template placeholders: {role}, {subreddit}. The template's first line must be "Subject: ...".
-Settings: dry_run, mail_mode, paused, daily_send_limit, poll_seconds, subreddits (joined with +),
-include_keywords, exclude_keywords (comma separated)."""
-
-TOOLS = [
-    {"name": "get_status", "description": "Current settings, counts of posts by status, counts of skip reasons, "
-                                          "and the last 10 Reddit checks (time, posts fetched, new, drafted, error).",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "list_posts", "description": "Most recent posts the bot handled, with title, link, status and the reason "
-                                          "it was skipped. Filter by status and/or text the reason must contain "
-                                          "(e.g. 'no email', 'exclude').",
-     "input_schema": {"type": "object", "properties": {
-         "status": {"type": "string", "enum": ["any", "skipped", "pending", "sent", "rejected", "failed"]},
-         "reason_contains": {"type": "string"},
-         "limit": {"type": "integer", "minimum": 1, "maximum": 50}}}},
-    {"name": "update_setting", "description": "Change one setting.",
-     "input_schema": {"type": "object", "properties": {
-         "key": {"type": "string", "enum": sorted(DEFAULTS)}, "value": {"type": "string"}},
-         "required": ["key", "value"]}},
-    {"name": "read_text", "description": "Read the mail prompt, the mail template, or the candidate profile.",
-     "input_schema": {"type": "object", "properties": {
-         "which": {"type": "string", "enum": ["mail_prompt", "mail_template", "profile"]}}, "required": ["which"]}},
-    {"name": "write_text", "description": "Replace the full text of the mail prompt, mail template, or profile. "
-                                          "The previous version is backed up.",
-     "input_schema": {"type": "object", "properties": {
-         "which": {"type": "string", "enum": ["mail_prompt", "mail_template", "profile"]},
-         "text": {"type": "string"}}, "required": ["which", "text"]}},
-    {"name": "preview_post", "description": "Draft an email for one Reddit post URL using the current mail mode and "
-                                            "post it here with Send/Edit/Skip buttons. Skips keyword filters.",
-     "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-]
-TEXT_FILES = {"mail_prompt": PROMPT_FILE, "mail_template": TEMPLATE_FILE, "profile": PROFILE_FILE}
-
-
-async def run_tool(name: str, args: dict) -> str:
-    if name == "get_status":
-        counts = dict(db.execute("SELECT status, count(*) FROM posts GROUP BY status").fetchall())
-        reasons = db.execute("SELECT reason, count(*) FROM posts WHERE status='skipped' "
-                             "GROUP BY reason ORDER BY 2 DESC LIMIT 15").fetchall()
-        polls = [{"time_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts)), "fetched": f, "new": n,
-                  "drafted": d, "error": e}
-                 for ts, f, n, d, e in db.execute("SELECT * FROM polls ORDER BY ts DESC LIMIT 10")]
-        return json.dumps({"now_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
-                           "settings": {k: setting(k) for k in DEFAULTS},
-                           "posts_by_status": counts, "skip_reasons": dict(reasons),
-                           "sent_last_24h": sent_last_24h(), "last_checks": polls})
-    if name == "list_posts":
-        sql, params = "SELECT title, url, status, reason, email FROM posts WHERE 1=1", []
-        if args.get("status", "any") != "any":
-            sql += " AND status=?"; params.append(args["status"])
-        if args.get("reason_contains"):
-            sql += " AND reason LIKE ?"; params.append(f"%{args['reason_contains']}%")
-        sql += " ORDER BY created DESC LIMIT ?"; params.append(int(args.get("limit", 15)))
-        cols = ["title", "url", "status", "reason", "email"]
-        return json.dumps([dict(zip(cols, r)) for r in db.execute(sql, params)])
-    if name == "update_setting":
-        set_setting(args["key"], args["value"])
-        return f"{args['key']} = {setting(args['key'])}"
-    if name == "read_text":
-        return TEXT_FILES[args["which"]].read_text(encoding="utf-8")
-    if name == "write_text":
-        path = TEXT_FILES[args["which"]]
-        backup = path.with_name(f"{path.stem}.{int(time.time())}.bak{path.suffix}")
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-        path.write_text(args["text"], encoding="utf-8")
-        return f"Saved. Backup at {backup.name}"
-    if name == "preview_post":
-        post = await reddit.submission(url=args["url"])
-        return await process(post, force=True)
-    return f"Unknown tool {name}"
-
-
-history: list[dict] = []  # plain-text turns only, to keep each call cheap
-
-
-async def chat(user_text: str) -> str:
-    messages = [*history[-12:], {"role": "user", "content": user_text}]
-    for _ in range(8):
-        response = await claude_client().messages.create(
-            model=CHAT_MODEL, max_tokens=8000, output_config={"effort": "low"},
-            system=CHAT_SYSTEM, tools=TOOLS, messages=messages,
-        )
-        if response.stop_reason == "refusal":
-            return "The model declined that request."
-        if response.stop_reason != "tool_use":
-            break
-        messages.append({"role": "assistant", "content": response.content})
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                try:
-                    out, err = await run_tool(block.name, block.input), False
-                except Exception as e:
-                    out, err = f"Error: {e}", True
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": out, "is_error": err})
-        messages.append({"role": "user", "content": results})
-    reply = "\n".join(b.text for b in response.content if b.type == "text").strip() or "Done."
-    history.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])
-    return reply
-
-
 # ------------------------------------------------- !commands (no AI) -----
 COMMANDS_HELP = """**Commands** (free, no AI)
 `!status` — settings, post counts, last Reddit checks
@@ -523,8 +424,14 @@ COMMANDS_HELP = """**Commands** (free, no AI)
 `!jobs [n]` — last n hiring posts that had no email (apply to them yourself)
 `!pending` — drafts waiting for Send/Skip
 `!sent` — emails already sent
+`!sub` — list subreddits · `!sub add <name>` · `!sub remove <name>`
+`!settings` — all settings
+`!set <name> <value>` — change one, e.g. `!set dry_run false`, `!set subreddits forhire+remotejobs`
 `!help` — this list
-Anything not starting with `!` goes to the AI assistant."""
+
+**AI (costs tokens, only when you ask)**
+`!draft <reddit link>` — Claude writes an email for that post
+**AI draft** button on any draft — rewrite it with Claude"""
 
 
 def ago(ts: float | None) -> str:
@@ -592,7 +499,43 @@ def run_command(text: str) -> str:
                           "ORDER BY created DESC LIMIT ?", (status, n)).fetchall()
         return f"**{status.capitalize()}**\n" + post_lines(rows)
 
+    if cmd == "!sub":
+        subs = [s for s in setting("subreddits").split("+") if s]
+        if len(args) == 2 and args[0] in ("add", "remove"):
+            name = args[1].removeprefix("r/")
+            if args[0] == "add" and name.lower() not in [s.lower() for s in subs]:
+                subs.append(name)
+            elif args[0] == "remove":
+                subs = [s for s in subs if s.lower() != name.lower()]
+            set_setting("subreddits", "+".join(subs))
+        return f"**Watching {len(subs)} subreddits:** " + ", ".join(f"r/{s}" for s in subs) + \
+            "\nAdd/remove: `!sub add remotejobs`, `!sub remove startups`"
+
+    if cmd == "!settings":
+        return "**Settings**\n" + "\n".join(f"• `{k}` = {setting(k)}" for k in DEFAULTS)
+
+    if cmd == "!set":
+        if len(args) < 2 or args[0] not in DEFAULTS:
+            return "Usage: `!set <name> <value>`. Names: " + ", ".join(f"`{k}`" for k in DEFAULTS)
+        set_setting(args[0], text.strip().split(None, 2)[2])
+        return f"`{args[0]}` = {setting(args[0])}"
+
     return COMMANDS_HELP
+
+
+async def draft_command(text: str) -> tuple[str, str | None]:
+    """!draft <url>: AI-draft an email for one post. Returns (message, post_id or None)."""
+    parts = text.split()
+    if len(parts) < 2:
+        return "Usage: `!draft <reddit post link>`", None
+    post = await reddit.submission(url=parts[1].strip("<>"))
+    await post.load()
+    email = find_email(f"{post.title}\n{post.selftext or ''}")
+    subject, body = await ai_draft(post.title, post.selftext or "", post.subreddit.display_name)
+    save(post.id, url=f"https://www.reddit.com{post.permalink}", title=post.title, status="pending",
+         email=email, subject=subject, body=body)
+    note = "" if email else " No email in the post, so send it yourself (DM or form)."
+    return f"AI draft ready.{note}", post.id
 
 
 def split_message(text: str, limit: int = 1900) -> list[str]:
@@ -609,6 +552,18 @@ def split_message(text: str, limit: int = 1900) -> list[str]:
 async def on_message(message: discord.Message):
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID or message.author.id != DISCORD_OWNER_ID:
         return
+    if message.content.lower().startswith("!draft"):
+        async with message.channel.typing():
+            try:
+                msg, post_id = await draft_command(message.content)
+            except Exception as e:
+                msg, post_id = f"Draft failed: {e}", None
+        if post_id:
+            await message.reply(msg, embed=draft_embed(load(post_id)), view=draft_buttons(post_id),
+                                mention_author=False)
+        else:
+            await message.reply(msg, mention_author=False)
+        return
     if message.content.startswith("!"):  # free commands, no AI
         out = run_command(message.content)
         chunks = split_message(out)
@@ -620,13 +575,7 @@ async def on_message(message: discord.Message):
             for chunk in chunks:
                 await message.reply(chunk, mention_author=False, suppress_embeds=True)
         return
-    async with message.channel.typing():
-        try:
-            reply = await chat(message.content)
-        except Exception as e:  # includes a missing ANTHROPIC_API_KEY
-            reply = f"Chat unavailable (Claude): {e}"
-    for i in range(0, len(reply), 1900):
-        await message.reply(reply[i:i + 1900], mention_author=False)
+    await message.reply("Chat is off to save tokens. Type `!help` for commands.", mention_author=False)
 
 
 # ---------------------------------------------------------------- start -----
@@ -643,8 +592,8 @@ async def on_ready():
         timeout=60,  # default is 16s, which slow responses can exceed
     )
     await (await channel()).send(
-        f"Job agent online. dry_run={setting('dry_run')}, mail_mode={setting('mail_mode')}, "
-        f"limit={setting('daily_send_limit')}/day, watching r/{setting('subreddits')}. Talk to me here."
+        f"👋 Hey{' ' + FROM_NAME.split()[0] if FROM_NAME else ''}, I'm back online and hunting jobs across "
+        f"{len(setting('subreddits').split('+'))} subreddits. Type `!help` for commands."
     )
     bot._poller = asyncio.create_task(poll_reddit())
 

@@ -1,12 +1,12 @@
 # Reddit job agent
 
 Watches hiring subreddits, keeps posts that match your keywords **and** contain an email, drafts an
-application, and posts it to Discord with **Send / Edit / Skip** buttons. You can also chat with the bot
-in that channel (Claude Haiku) to change settings or rewrite how emails are written.
+application, and posts it to Discord with **Send / Edit / AI draft / Skip** buttons. You control it with
+free `!commands`; there is no AI chat.
 
 - **Filtering:** keywords + regex only. Costs nothing.
-- **Email drafts:** `mail_mode=template` fills `mail_template.md` (free, for testing the flow).
-  `mail_mode=ai` has Claude write each email from `mail_prompt.md` + `profile.md`.
+- **Email drafts:** filled from `mail_template.md` (free). Claude only writes a draft when you ask:
+  the **AI draft** button, or `!draft <reddit link>` (uses `mail_prompt.md` + `profile.md`).
 - **Limits:** 10 emails per 24h by default. One email per address, ever.
 
 ## Files you edit
@@ -34,17 +34,16 @@ Discord setup: Developer Portal → your app → **Bot** → copy the token and 
 OAuth2 → URL generator → scope `bot`, permissions *Send Messages, Embed Links, Read Message History*. Invite it.
 Turn on Developer Mode in Discord to copy the channel id and your user id.
 
-## Talk to it in Discord
+## Commands in Discord
 
-- "status"
-- "pause" / "resume"
-- "switch to ai mode" / "back to template mode"
-- "set the daily limit to 5"
-- "add r/startups to the subreddits"
-- "make the emails shorter and mention I can start this week"  → rewrites `mail_prompt.md` (old version backed up)
-- "preview https://www.reddit.com/r/forhire/comments/..."  → drafts an email for that post with buttons
+Type `!help` in the channel for the full list. Main ones:
 
-Settings changed from Discord are stored in `state.db` and override `.env`.
+- `!status`, `!skipped`, `!reasons`, `!jobs`, `!pending`, `!sent`
+- `!settings` and `!set <name> <value>`, e.g. `!set paused true`, `!set daily_send_limit 5`
+- `!draft <reddit link>` — Claude writes an email for that post (costs a fraction of a cent)
+
+Settings changed with `!set` are stored in `state.db` and override `.env`.
+To change how AI drafts are written, edit `mail_prompt.md` on the VPS.
 
 ## Run it 24/7 on the VPS
 
