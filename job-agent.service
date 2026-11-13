@@ -1,0 +1,14 @@
+[Unit]
+Description=Reddit job agent (Discord approval bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jobagent
+WorkingDirectory=/opt/job-agent
+ExecStart=/opt/job-agent/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

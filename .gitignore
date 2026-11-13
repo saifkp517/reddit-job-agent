@@ -1,0 +1,14 @@
+# secrets and runtime state (live only on the VPS)
+.env
+.env.*
+!.env.example
+state.db
+profile.md
+resume.pdf
+*.bak.md
+
+# environments
+.venv/
+.venv-linux/
+venv/
+__pycache__/
