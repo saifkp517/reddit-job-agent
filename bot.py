@@ -74,8 +74,16 @@ db.execute(
     """CREATE TABLE IF NOT EXISTS polls (
         ts REAL, fetched INTEGER, new INTEGER, drafted INTEGER, error TEXT)"""
 )
-if "reason" not in [c[1] for c in db.execute("PRAGMA table_info(posts)")]:
-    db.execute("ALTER TABLE posts ADD COLUMN reason TEXT")  # why a post was skipped
+_cols = [c[1] for c in db.execute("PRAGMA table_info(posts)")]
+for _col in ("reason",    # why a post was skipped
+             "contact",   # how to apply: email | link | dm
+             "link",      # apply link, when contact = link
+             "author"):   # Reddit username, for DMs
+    if _col not in _cols:
+        db.execute(f"ALTER TABLE posts ADD COLUMN {_col} TEXT")
+# Older versions stored hiring posts without an email as skipped; they're leads now.
+db.execute("UPDATE posts SET status='lead', contact='dm', reason=NULL "
+           "WHERE status='skipped' AND reason='hiring post, but no email'")
 db.commit()
 
 # Settings live in the db so the Discord assistant can change them at runtime.
@@ -89,6 +97,7 @@ DEFAULTS = {
     "subreddits": env("SUBREDDITS", "forhire+hiring+remotejs+jobbit"),
     "include_keywords": env("INCLUDE_KEYWORDS", "[hiring],hiring,we're hiring,looking for a"),
     "exclude_keywords": env("EXCLUDE_KEYWORDS", "[for hire],for hire,unpaid,equity only,rev share,telegram"),
+    "notify_leads": env("NOTIFY_LEADS", "true"),  # also post DM / apply-link jobs to Discord
 }
 
 
@@ -141,7 +150,8 @@ def save(post_id: str, **fields) -> None:
 
 
 def load(post_id: str) -> dict | None:
-    cur = db.execute("SELECT id,url,title,status,email,subject,body FROM posts WHERE id=?", (post_id,))
+    cur = db.execute("SELECT id,url,title,status,email,subject,body,contact,link,author FROM posts WHERE id=?",
+                     (post_id,))
     row = cur.fetchone()
     return dict(zip([c[0] for c in cur.description], row)) if row else None
 
@@ -160,6 +170,27 @@ def skip_reason(title: str, text: str) -> str | None:
             return f"exclude keyword: {k}"
     if not any(has_phrase(haystack, k) for k in keywords("include_keywords")):
         return "no include keyword"
+    return None
+
+
+URL_RE = re.compile(r"https?://[^\s)\]>\"']+", re.I)
+JOB_LINK_DOMAINS = ("forms.gle", "docs.google.com/forms", "typeform", "tally.so", "jotform", "airtable.com",
+                    "lever.co", "greenhouse.io", "ashbyhq", "workable", "wellfound", "angel.co", "linkedin.com/jobs",
+                    "indeed.", "careers", "/jobs", "/job/", "/apply", "bamboohr", "recruitee", "breezy.hr",
+                    "smartrecruiters", "notion.site", "remotefast", "weworkremotely", "remoteok")
+IGNORED_LINK_DOMAINS = ("reddit.com", "redd.it", "imgur.com", "discord.gg", "discord.com")
+
+
+def apply_link(text: str) -> str | None:
+    """An application link in the post: a job board / form URL, or any URL right after the word 'apply'."""
+    for m in URL_RE.finditer(text):
+        url = m.group(0).rstrip(".,;:")
+        low = url.lower()
+        if any(d in low for d in IGNORED_LINK_DOMAINS):
+            continue
+        before = text[max(0, m.start() - 80):m.start()].lower()
+        if any(d in low for d in JOB_LINK_DOMAINS) or "apply" in before:
+            return url
     return None
 
 
@@ -258,11 +289,22 @@ bot = discord.Client(intents=intents)
 reddit: asyncpraw.Reddit | None = None
 
 
+CONTACT_LABEL = {"email": "📧 EMAIL", "link": "🔗 APPLY LINK", "dm": "💬 DM"}
+
+
+def dm_url(author: str | None) -> str | None:
+    return f"https://www.reddit.com/message/compose/?to={author}" if author else None
+
+
 def draft_embed(row: dict, color: discord.Color = discord.Color.blurple()) -> discord.Embed:
     e = discord.Embed(title=(row["title"] or "")[:250], url=row["url"], color=color)
-    e.add_field(name="To", value=row["email"] or "-", inline=True)
-    e.add_field(name="Subject", value=(row["subject"] or "-")[:1000], inline=True)
-    e.add_field(name="Body", value=(row["body"] or "-")[:1024], inline=False)
+    contact = row.get("contact") or ("email" if row.get("email") else "dm")
+    how = {"email": row.get("email"), "link": row.get("link"),
+           "dm": f"u/{row['author']}" if row.get("author") else "the post author"}[contact]
+    e.add_field(name=CONTACT_LABEL[contact], value=(how or "-")[:1000], inline=False)
+    if row.get("subject") or row.get("body"):
+        e.add_field(name="Subject", value=(row["subject"] or "-")[:1000], inline=False)
+        e.add_field(name="Body", value=(row["body"] or "-")[:1024], inline=False)
     return e
 
 
@@ -271,9 +313,17 @@ def draft_buttons(post_id: str) -> discord.ui.View:
     row = load(post_id) or {}
     if row.get("email"):  # no address = draft is for a DM/form you send yourself
         view.add_item(discord.ui.Button(label="Send", style=discord.ButtonStyle.success, custom_id=f"send:{post_id}"))
-    view.add_item(discord.ui.Button(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"edit:{post_id}"))
+    if row.get("subject") or row.get("body"):
+        view.add_item(discord.ui.Button(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"edit:{post_id}"))
     view.add_item(discord.ui.Button(label="AI draft", style=discord.ButtonStyle.primary, custom_id=f"ai:{post_id}"))
     view.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.danger, custom_id=f"skip:{post_id}"))
+    # link buttons open in the browser; they don't hit the bot
+    if row.get("contact") == "dm" and dm_url(row.get("author")):
+        view.add_item(discord.ui.Button(label="DM author", style=discord.ButtonStyle.link, url=dm_url(row["author"])))
+    if row.get("link"):
+        view.add_item(discord.ui.Button(label="Apply", style=discord.ButtonStyle.link, url=row["link"][:512]))
+    if row.get("url"):
+        view.add_item(discord.ui.Button(label="Open post", style=discord.ButtonStyle.link, url=row["url"]))
     return view
 
 
@@ -354,20 +404,30 @@ async def process(post, *, force: bool = False) -> str:
     if reason:
         save(post.id, url=url, title=title, status="skipped", reason=reason)
         return reason
+    author = str(post.author) if post.author else None
     email = find_email(f"{title}\n{text}")
     if not email:
-        save(post.id, url=url, title=title, status="skipped", reason="hiring post, but no email")
-        return "hiring post, but no email"
+        # No email: a lead you apply to yourself, via the apply link or a DM.
+        link = apply_link(text)
+        contact = "link" if link else "dm"
+        save(post.id, url=url, title=title, status="lead", contact=contact, link=link, author=author)
+        if as_bool(setting("notify_leads")):
+            await (await channel()).send(f"**{CONTACT_LABEL[contact]}** · r/{sub}",
+                                         embed=draft_embed(load(post.id), discord.Color.gold()),
+                                         view=draft_buttons(post.id))
+            return f"lead posted ({contact})"
+        return f"lead saved ({contact})"
     if not force and already_emailed(email):
         save(post.id, url=url, title=title, status="skipped", email=email, reason="already contacted")
         return f"already contacted {email}"
 
     subject, body = await make_draft(title, text, sub)
-    save(post.id, url=url, title=title, status="pending", email=email, subject=subject, body=body)
+    save(post.id, url=url, title=title, status="pending", email=email, subject=subject, body=body,
+         contact="email", author=author)
     row = load(post.id)
     ch = await channel()
     if as_bool(setting("dry_run")) or force:
-        await ch.send(f"New match ({setting('mail_mode')} draft) — send it?", embed=draft_embed(row),
+        await ch.send(f"**{CONTACT_LABEL['email']}** · r/{sub} · send it?", embed=draft_embed(row),
                       view=draft_buttons(post.id))
         return f"draft posted for {email}"
     result = await send_email(post.id)
@@ -400,7 +460,7 @@ async def poll_reddit() -> None:
                     new += 1
                     try:
                         result = await process(post)
-                        drafted += result.startswith(("draft posted", "Sent"))
+                        drafted += result.startswith(("draft posted", "Sent", "lead posted"))
                     except Exception as e:
                         if type(e).__name__ == "RateLimitError":
                             break  # Claude rate limit: retry the rest next poll
@@ -421,7 +481,7 @@ COMMANDS_HELP = """**Commands** (free, no AI)
 `!status` — settings, post counts, last Reddit checks
 `!skipped [n] [word]` — every skipped post with the reason (or just the last n). Add a word to filter by reason or title, e.g. `!skipped email`, `!skipped 30 exclude`. Long lists come as a .txt file
 `!reasons` — how many posts were skipped for each reason
-`!jobs [n]` — last n hiring posts that had no email (apply to them yourself)
+`!jobs [dm|link|email] [n]` — every hiring post found, by how to apply, e.g. `!jobs dm`, `!jobs link 10`
 `!pending` — drafts waiting for Send/Skip
 `!sent` — emails already sent
 `!sub` — list subreddits · `!sub add <name>` · `!sub remove <name>`
@@ -489,9 +549,21 @@ def run_command(text: str) -> str:
         return "**Skip reasons**\n" + ("\n".join(f"• {r}: {c}" for r, c in rows) or "Nothing skipped yet.")
 
     if cmd == "!jobs":
-        rows = db.execute("SELECT title, url, NULL, NULL, created FROM posts WHERE reason='hiring post, but no email' "
-                          "ORDER BY created DESC LIMIT ?", (n,)).fetchall()
-        return f"**Hiring posts without an email** (apply via DM or link)\n" + post_lines(rows)
+        kind = next((a.lower() for a in args if a.lower() in CONTACT_LABEL), None)
+        sql = ("SELECT title, url, NULL, CASE contact WHEN 'email' THEN '📧 ' || email "
+               "WHEN 'link' THEN '🔗 ' || link ELSE coalesce('💬 DM u/' || author, '💬 DM (see post)') END, created "
+               "FROM posts WHERE contact IS NOT NULL AND status != 'rejected'")
+        params = []
+        if kind:
+            sql += " AND contact=?"
+            params.append(kind)
+        limit = n if any(a.isdigit() for a in args) else -1
+        rows = db.execute(sql + " ORDER BY created DESC LIMIT ?", (*params, limit)).fetchall()
+        counts = dict(db.execute("SELECT contact, count(*) FROM posts WHERE contact IS NOT NULL "
+                                 "AND status != 'rejected' GROUP BY contact").fetchall())
+        summary = " · ".join(f"{CONTACT_LABEL[k]} {counts.get(k, 0)}" for k in CONTACT_LABEL)
+        title = f"{CONTACT_LABEL[kind]} jobs" if kind else "All jobs"
+        return f"**{title}** ({summary})\n" + post_lines(rows)
 
     if cmd in ("!pending", "!sent"):
         status = cmd[1:]
