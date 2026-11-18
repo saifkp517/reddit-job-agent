@@ -1,11 +1,9 @@
 """Reddit hiring-post watcher with a Discord control room.
 
 - Filters Reddit posts with keywords + regex only (no LLM, no cost).
-- Drafts the email from a template (mail_mode=template, free) or with Claude
-  using the editable prompt in mail_prompt.md (mail_mode=ai).
-- Dry run: every draft goes to Discord with Send / Edit / AI draft / Skip buttons.
-- Control it with free !commands in Discord. Claude is only used to write a draft
-  when you ask (!draft <link> or the AI draft button). There is no AI chat.
+- Drafts the email from mail_template.md. No AI anywhere.
+- Dry run: every draft goes to Discord with Send / Edit / Skip buttons.
+- Control it with !commands in Discord.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ from pathlib import Path
 import asyncpraw
 import discord
 from dotenv import load_dotenv
-from pydantic import BaseModel
 
 from email_extract import find_email
 
@@ -50,10 +47,6 @@ SMTP_PASSWORD = env("SMTP_PASSWORD")
 FROM_NAME = env("FROM_NAME", "")
 RESUME_PATH = env("RESUME_PATH", "")  # optional PDF attachment; the template already links the resume
 
-MAIL_MODEL = env("MAIL_MODEL", "claude-haiku-5-5")  # AI drafts: !draft, the AI draft button, mail_mode=ai
-
-PROFILE_FILE = HERE / "profile.md"
-PROMPT_FILE = HERE / "mail_prompt.md"
 TEMPLATE_FILE = HERE / "mail_template.md"
 DB_PATH = HERE / "state.db"
 
@@ -90,7 +83,6 @@ db.commit()
 # .env values are only the first-run defaults.
 DEFAULTS = {
     "dry_run": env("DRY_RUN", "true"),
-    "mail_mode": env("MAIL_MODE", "template"),  # template | ai
     "paused": "false",
     "daily_send_limit": env("DAILY_SEND_LIMIT", "10"),
     "poll_seconds": env("POLL_SECONDS", "300"),
@@ -208,43 +200,7 @@ def template_draft(title: str, subreddit: str) -> tuple[str, str]:
     return first.removeprefix("Subject:").strip(), rest.strip()
 
 
-class Draft(BaseModel):
-    subject: str
-    body: str
-
-
-_claude = None
-
-
-def claude_client():
-    """Import the Anthropic SDK only when Claude is actually used (an AI draft)."""
-    global _claude
-    if _claude is None:
-        import anthropic
-        _claude = anthropic.AsyncAnthropic()
-    return _claude
-
-
-async def ai_draft(title: str, text: str, subreddit: str) -> tuple[str, str]:
-    system = (PROMPT_FILE.read_text(encoding="utf-8")
-              + "\n\n<profile>\n" + PROFILE_FILE.read_text(encoding="utf-8") + "\n</profile>")
-    response = await claude_client().messages.parse(
-        model=MAIL_MODEL,
-        max_tokens=4000,
-        output_config={"effort": "low"},
-        system=system,
-        messages=[{"role": "user", "content":
-                   f"<post subreddit=\"r/{subreddit}\">\n<title>{title}</title>\n<body>\n{text[:8000]}\n</body>\n</post>"}],
-        output_format=Draft,
-    )
-    if response.stop_reason == "refusal" or not response.parsed_output:
-        raise RuntimeError("Model declined to draft this email")
-    return response.parsed_output.subject, response.parsed_output.body
-
-
 async def make_draft(title: str, text: str, subreddit: str) -> tuple[str, str]:
-    if setting("mail_mode") == "ai":
-        return await ai_draft(title, text, subreddit)
     return template_draft(title, subreddit)
 
 
@@ -315,7 +271,6 @@ def draft_buttons(post_id: str) -> discord.ui.View:
         view.add_item(discord.ui.Button(label="Send", style=discord.ButtonStyle.success, custom_id=f"send:{post_id}"))
     if row.get("subject") or row.get("body"):
         view.add_item(discord.ui.Button(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"edit:{post_id}"))
-    view.add_item(discord.ui.Button(label="AI draft", style=discord.ButtonStyle.primary, custom_id=f"ai:{post_id}"))
     view.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.danger, custom_id=f"skip:{post_id}"))
     # link buttons open in the browser; they don't hit the bot
     if row.get("contact") == "dm" and dm_url(row.get("author")):
@@ -325,15 +280,6 @@ def draft_buttons(post_id: str) -> discord.ui.View:
     if row.get("url"):
         view.add_item(discord.ui.Button(label="Open post", style=discord.ButtonStyle.link, url=row["url"]))
     return view
-
-
-async def ai_redraft(post_id: str) -> str:
-    """Rewrite one post's draft with Claude. Only runs when you ask (button or !draft)."""
-    post = await reddit.submission(id=post_id)
-    await post.load()
-    subject, body = await ai_draft(post.title, post.selftext or "", post.subreddit.display_name)
-    save(post_id, subject=subject, body=body)
-    return "AI draft ready."
 
 
 class EditModal(discord.ui.Modal, title="Edit email"):
@@ -357,7 +303,7 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
         return
     action, _, post_id = (interaction.data or {}).get("custom_id", "").partition(":")
-    if action not in {"send", "edit", "skip", "ai"}:
+    if action not in {"send", "edit", "skip"}:
         return
     if interaction.user.id != DISCORD_OWNER_ID:
         await interaction.response.send_message("Not yours.", ephemeral=True)
@@ -371,14 +317,6 @@ async def on_interaction(interaction: discord.Interaction):
         save(post_id, status="rejected")
         await interaction.response.edit_message(content="Skipped.",
                                                 embed=draft_embed(row, discord.Color.dark_grey()), view=None)
-    elif action == "ai":
-        await interaction.response.defer()
-        try:
-            result = await ai_redraft(post_id)
-        except Exception as e:
-            result = f"AI draft failed: {e}"
-        await interaction.message.edit(content=result, embed=draft_embed(load(post_id)),
-                                       view=draft_buttons(post_id))
     else:
         await interaction.response.defer()
         result = await send_email(post_id)
@@ -462,8 +400,6 @@ async def poll_reddit() -> None:
                         result = await process(post)
                         drafted += result.startswith(("draft posted", "Sent", "lead posted"))
                     except Exception as e:
-                        if type(e).__name__ == "RateLimitError":
-                            break  # Claude rate limit: retry the rest next poll
                         log.exception("Failed handling %s", post.id)
                         save(post.id, url=post.permalink, title=post.title, status="failed",
                              reason=f"error: {e}"[:300])
@@ -476,8 +412,8 @@ async def poll_reddit() -> None:
         await asyncio.sleep(int(setting("poll_seconds")))
 
 
-# ------------------------------------------------- !commands (no AI) -----
-COMMANDS_HELP = """**Commands** (free, no AI)
+# ------------------------------------------------- !commands -----
+COMMANDS_HELP = """**Commands** 
 `!status` — settings, post counts, last Reddit checks
 `!skipped [n] [word]` — every skipped post with the reason (or just the last n). Add a word to filter by reason or title, e.g. `!skipped email`, `!skipped 30 exclude`. Long lists come as a .txt file
 `!reasons` — how many posts were skipped for each reason
@@ -487,11 +423,7 @@ COMMANDS_HELP = """**Commands** (free, no AI)
 `!sub` — list subreddits · `!sub add <name>` · `!sub remove <name>`
 `!settings` — all settings
 `!set <name> <value>` — change one, e.g. `!set dry_run false`, `!set subreddits forhire+remotejobs`
-`!help` — this list
-
-**AI (costs tokens, only when you ask)**
-`!draft <reddit link>` — Claude writes an email for that post
-**AI draft** button on any draft — rewrite it with Claude"""
+`!help` — this list"""
 
 
 def ago(ts: float | None) -> str:
@@ -524,7 +456,7 @@ def run_command(text: str) -> str:
         polls = db.execute("SELECT ts, fetched, new, drafted, error FROM polls ORDER BY ts DESC LIMIT 5").fetchall()
         lines = [
             f"**Status** · paused={setting('paused')} · dry_run={setting('dry_run')} · "
-            f"mail_mode={setting('mail_mode')} · sent today {sent_last_24h()}/{setting('daily_send_limit')}",
+            f"sent today {sent_last_24h()}/{setting('daily_send_limit')}",
             "**Posts:** " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"),
             f"**Checking every {int(setting('poll_seconds')) // 60} min.** Last checks:",
         ]
@@ -595,21 +527,6 @@ def run_command(text: str) -> str:
     return COMMANDS_HELP
 
 
-async def draft_command(text: str) -> tuple[str, str | None]:
-    """!draft <url>: AI-draft an email for one post. Returns (message, post_id or None)."""
-    parts = text.split()
-    if len(parts) < 2:
-        return "Usage: `!draft <reddit post link>`", None
-    post = await reddit.submission(url=parts[1].strip("<>"))
-    await post.load()
-    email = find_email(f"{post.title}\n{post.selftext or ''}")
-    subject, body = await ai_draft(post.title, post.selftext or "", post.subreddit.display_name)
-    save(post.id, url=f"https://www.reddit.com{post.permalink}", title=post.title, status="pending",
-         email=email, subject=subject, body=body)
-    note = "" if email else " No email in the post, so send it yourself (DM or form)."
-    return f"AI draft ready.{note}", post.id
-
-
 def split_message(text: str, limit: int = 1900) -> list[str]:
     chunks, current = [], ""
     for line in text.split("\n"):
@@ -624,19 +541,7 @@ def split_message(text: str, limit: int = 1900) -> list[str]:
 async def on_message(message: discord.Message):
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID or message.author.id != DISCORD_OWNER_ID:
         return
-    if message.content.lower().startswith("!draft"):
-        async with message.channel.typing():
-            try:
-                msg, post_id = await draft_command(message.content)
-            except Exception as e:
-                msg, post_id = f"Draft failed: {e}", None
-        if post_id:
-            await message.reply(msg, embed=draft_embed(load(post_id)), view=draft_buttons(post_id),
-                                mention_author=False)
-        else:
-            await message.reply(msg, mention_author=False)
-        return
-    if message.content.startswith("!"):  # free commands, no AI
+    if message.content.startswith("!"):
         out = run_command(message.content)
         chunks = split_message(out)
         if len(chunks) > 5:  # long lists go out as one text file instead of a wall of messages
@@ -647,7 +552,7 @@ async def on_message(message: discord.Message):
             for chunk in chunks:
                 await message.reply(chunk, mention_author=False, suppress_embeds=True)
         return
-    await message.reply("Chat is off to save tokens. Type `!help` for commands.", mention_author=False)
+    await message.reply("Type `!help` for commands.", mention_author=False)
 
 
 # ---------------------------------------------------------------- start -----

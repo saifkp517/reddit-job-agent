@@ -1,12 +1,11 @@
 # Reddit job agent
 
 Watches hiring subreddits, keeps posts that match your keywords **and** contain an email, drafts an
-application, and posts it to Discord with **Send / Edit / AI draft / Skip** buttons. You control it with
-free `!commands`; there is no AI chat.
+application, and posts it to Discord with **Send / Edit / Skip** buttons. You control it with
+`!commands`. There is no AI anywhere.
 
 - **Filtering:** keywords + regex only. Costs nothing.
-- **Email drafts:** filled from `mail_template.md` (free). Claude only writes a draft when you ask:
-  the **AI draft** button, or `!draft <reddit link>` (uses `mail_prompt.md` + `profile.md`).
+- **Email drafts:** filled from `mail_template.md`.
 - **Limits:** 10 emails per 24h by default. One email per address, ever.
 
 ## Files you edit
@@ -14,9 +13,7 @@ free `!commands`; there is no AI chat.
 | File | What it is |
 |---|---|
 | `.env` | keys and first-run defaults |
-| `profile.md` | what you can do; used by the AI mail mode |
 | `mail_template.md` | the fixed email for template mode (`{role}`, `{subreddit}` get filled in) |
-| `mail_prompt.md` | instructions for the AI mail writer |
 | `SONNET_SUBREDDIT_PROMPT.md` | paste into Sonnet to research subreddits and keywords |
 
 ## Run it on your PC (PowerShell)
@@ -40,10 +37,9 @@ Type `!help` in the channel for the full list. Main ones:
 
 - `!status`, `!skipped`, `!reasons`, `!jobs`, `!pending`, `!sent`
 - `!settings` and `!set <name> <value>`, e.g. `!set paused true`, `!set daily_send_limit 5`
-- `!draft <reddit link>` — Claude writes an email for that post (costs a fraction of a cent)
 
 Settings changed with `!set` are stored in `state.db` and override `.env`.
-To change how AI drafts are written, edit `mail_prompt.md` on the VPS.
+To change the email, edit `mail_template.md` on the VPS.
 
 ## Run it 24/7 on the VPS
 
